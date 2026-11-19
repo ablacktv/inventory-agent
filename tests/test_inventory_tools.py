@@ -828,3 +828,48 @@ def test_classification_tie_break_is_numeric_for_numeric_ids():
     df = _frame([[100, "n", "EA", 50, 1], [98, "n", "EA", 50, 1]])
     out = _it.classify_inventory_abcd(df).set_index("Item Number")
     assert out.loc["98", "Sales Cum %"] == 50 and out.loc["100", "Sales Cum %"] == 100
+
+
+# ============================================================================
+# TIME-UNIT NORMALIZATION (validation fix: monthly demand vs annual holding cost)
+# ============================================================================
+
+class TestTimeUnitNormalization:
+    @pytest.fixture
+    def agent(self, monkeypatch):
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        return SupplyChainInventoryAgent()
+
+    def test_monthly_demand_annual_holding_eoq(self, agent):
+        res = agent.process_question(
+            "Find EOQ. Demand is 1,000 units per month, ordering cost is $25 per order, "
+            "and holding cost is $0.50 per unit per year."
+        )
+        assert res.success is True
+        fa = res.calculation_results["final_answer"]
+        assert math.isclose(fa["order_quantity"], 1095.45, abs_tol=0.01)
+        assert math.isclose(fa["total_annual_policy_cost"], 547.72, abs_tol=0.01)
+        assert "Unit conversion" in res.explanation
+
+    def test_weekly_and_daily_demand_converted_to_annual(self, agent):
+        r = agent.process_question("Find EOQ. Demand is 200 units per week, ordering cost is $40, holding cost is $4 per unit per year.")
+        assert math.isclose(r.calculation_results["final_answer"]["order_quantity"], math.sqrt(2 * 200 * 52 * 40 / 4), abs_tol=0.01)
+        r = agent.process_question("Find EOQ. Demand is 20 units per day, ordering cost is $40, holding cost is $4 per unit per year.")
+        assert math.isclose(r.calculation_results["final_answer"]["order_quantity"], math.sqrt(2 * 20 * 365 * 40 / 4), abs_tol=0.01)
+
+    def test_annual_demand_not_converted(self, agent):
+        r = agent.process_question("Annual demand is 10,000 units, setup expense is $50, and it costs $2 per unit per year to hold inventory. What is the EOQ?")
+        assert math.isclose(r.calculation_results["final_answer"]["order_quantity"], 707.11, abs_tol=0.01)
+
+    def test_already_converted_value_not_doubled(self, agent):
+        inputs, notes = agent.normalize_time_units(
+            "Demand is 1,000 units per month, holding cost $0.50 per unit per year.",
+            SupplyChainInventoryAgent.MODEL_EOQ, {"demand": 12000.0, "order_cost": 25, "holding_cost": 0.5})
+        assert inputs["demand"] == 12000.0
+
+    def test_rop_lead_time_weeks_with_daily_demand(self, agent):
+        q = ("Average demand is 40 units per day with a demand standard deviation of 5. "
+             "Lead time is 2 weeks. Service level is 95%. What is the safety stock and reorder point?")
+        r = agent.process_question(q)
+        inter = r.calculation_results["intermediate_calculations"]
+        assert math.isclose(inter["expected_lead_time_demand"], 40 * 14, abs_tol=0.01)
