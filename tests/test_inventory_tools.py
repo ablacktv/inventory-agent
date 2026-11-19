@@ -873,3 +873,55 @@ class TestTimeUnitNormalization:
         r = agent.process_question(q)
         inter = r.calculation_results["intermediate_calculations"]
         assert math.isclose(inter["expected_lead_time_demand"], 40 * 14, abs_tol=0.01)
+
+    def test_lead_time_std_in_weeks_with_daily_demand(self, agent):
+        r = agent.process_question(
+            "A product has average demand of 40 units per day with a standard deviation of 8 units per day. "
+            "Average lead time is 3 weeks with a standard deviation of 0.5 weeks. "
+            "Determine the safety stock and reorder point for a 95% service level.")
+        inter = r.calculation_results["intermediate_calculations"]
+        fa = r.calculation_results["final_answer"]
+        assert math.isclose(inter["sigma_lead_time"], 144.72, abs_tol=0.01)
+        assert math.isclose(fa["safety_stock"], 238.04, abs_tol=0.05)
+        assert math.isclose(fa["reorder_point"], 1078.04, abs_tol=0.05)
+        assert fa["variability_scenario"] == "Variable Demand and Variable Lead Time"
+
+
+QD_PROMPT = ("Annual demand is 5,000 units. Ordering cost is $60 per order and annual holding cost is 20% of unit cost. "
+             "The supplier charges $12 per unit for orders below 500 units, $11.50 for 500-999 units, and $11 for orders "
+             "of 1,000 units or more. Find the best order quantity and annual cost.")
+
+
+def test_price_first_discount_schedule_parsed():
+    s = SupplyChainInventoryAgent()._extract_discount_schedule(QD_PROMPT)
+    assert [(t["min_qty"], t["max_qty"], t["price"]) for t in s] == [(0, 499, 12.0), (500, 999, 11.5), (1000, None, 11.0)]
+
+
+def test_quantity_discount_detected_without_keyword(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    r = SupplyChainInventoryAgent().process_question(QD_PROMPT)
+    fa = r.calculation_results["final_answer"]
+    assert r.identified_model == SupplyChainInventoryAgent.MODEL_QUANTITY_DISCOUNT
+    assert fa["optimal_order_quantity"] == 1000.0 and fa["minimum_total_annual_cost"] == 56400.0
+
+
+def test_model_guard_overrides_gemini_misclassification(monkeypatch):
+    import inventory_agent as ia
+    monkeypatch.setattr(ia, "get_gemini_api_key", lambda: "fake")
+    a = SupplyChainInventoryAgent()
+    monkeypatch.setattr(a, "extract_with_gemini", lambda q, k: ("EOQ", 0.99, {"demand": 5000, "order_cost": 60, "holding_cost": 2, "unit_cost": 12}, []))
+    r = a.process_question(QD_PROMPT)
+    assert r.identified_model == SupplyChainInventoryAgent.MODEL_QUANTITY_DISCOUNT
+    assert r.calculation_results["final_answer"]["minimum_total_annual_cost"] == 56400.0
+
+
+def test_gemini_missing_lead_time_std_is_filled(monkeypatch):
+    import inventory_agent as ia
+    monkeypatch.setattr(ia, "get_gemini_api_key", lambda: "fake")
+    a = SupplyChainInventoryAgent()
+    monkeypatch.setattr(a, "extract_with_gemini", lambda q, k: ("SAFETY_STOCK_ROP", 0.99, {"avg_demand": 40, "std_demand": 8, "lead_time": 3, "std_lead_time": 0, "service_level": 0.95}, []))
+    r = a.process_question("A product has average demand of 40 units per day with a standard deviation of 8 units per day. "
+                           "Average lead time is 3 weeks with a standard deviation of 0.5 weeks. "
+                           "Determine the safety stock and reorder point for a 95% service level.")
+    fa = r.calculation_results["final_answer"]
+    assert math.isclose(fa["reorder_point"], 1078.04, abs_tol=0.05)
