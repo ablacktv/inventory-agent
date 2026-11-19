@@ -15,6 +15,7 @@ Input Extraction:
 from dataclasses import dataclass, field
 import json
 import os
+import math
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 import inventory_tools
@@ -702,6 +703,123 @@ Rules:
 
         return inputs, missing
 
+    # ------------------------------------------------------------------------
+    # STEP 2b: TIME-UNIT NORMALIZATION (DETERMINISTIC PYTHON)
+    # ------------------------------------------------------------------------
+    _PERIODS_PER_YEAR = {"day": 365.0, "week": 52.0, "month": 12.0, "quarter": 4.0, "year": 1.0}
+    _DAYS_PER_PERIOD = {"day": 1.0, "week": 7.0, "month": 365.0 / 12.0, "quarter": 365.0 / 4.0, "year": 365.0}
+    _PERIOD_WORDS = {
+        "day": "day", "days": "day", "daily": "day",
+        "week": "week", "weeks": "week", "weekly": "week",
+        "month": "month", "months": "month", "monthly": "month",
+        "quarter": "quarter", "quarters": "quarter", "quarterly": "quarter",
+        "year": "year", "years": "year", "yearly": "year", "annual": "year", "annually": "year", "annum": "year",
+    }
+
+    @staticmethod
+    def _num(s: str) -> float:
+        return float(s.replace(",", "").rstrip(".,"))
+
+    def _detect_demand_period(self, text: str) -> Optional[Tuple[float, str]]:
+        """Return (stated_demand_value, period) when the question states a demand rate with a time unit."""
+        num = r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
+        pw = r"(day|week|month|quarter|year|annum)"
+        # "monthly demand is 1,000", "annual usage of 12,000"
+        m = re.search(r"\b(daily|weekly|monthly|quarterly|annual|yearly)\s+(?:average\s+)?(?:demand|usage|sales|requirements?)\b[^\d$]{0,40}" + num, text, re.I)
+        if m:
+            return self._num(m.group(2)), self._PERIOD_WORDS[m.group(1).lower()]
+        # "demand is 1,000 units per month", "sells 50 units a day", "25 units/day"
+        m = re.search(r"(?<![\$\d.,])" + num + r"\s*(?:units?|items?|pieces?|cases?|boxes|pallets|bags|cartons)?\s*(?:per|/|a|an|each)\s*" + pw + r"\b", text, re.I)
+        if m:
+            ctx = text[max(0, m.start() - 60):m.start()].lower()
+            if not re.search(r"(holding|carrying|storage|cost|price|\$)\s*[^.]*$", ctx):
+                return self._num(m.group(1)), self._PERIOD_WORDS[m.group(2).lower()]
+        # "demand per month is 1,000"
+        m = re.search(r"(?:demand|usage|sales)\s+(?:per|each|a)\s+" + pw + r"\b[^\d$]{0,20}" + num, text, re.I)
+        if m:
+            return self._num(m.group(2)), self._PERIOD_WORDS[m.group(1).lower()]
+        return None
+
+    def _detect_holding_period(self, text: str) -> str:
+        """Holding cost period; holding cost is annual unless another period is stated."""
+        m = re.search(r"(?:holding|carrying|storage)[^.;]*?(?:per|/|a|each)\s*(?:unit\s*(?:per|/|a|each)\s*)?(day|week|month|quarter|year|annum)\b", text, re.I)
+        if m:
+            return self._PERIOD_WORDS[m.group(1).lower()]
+        m = re.search(r"\b(daily|weekly|monthly|quarterly|annual|yearly)\s+(?:holding|carrying)", text, re.I)
+        if m:
+            return self._PERIOD_WORDS[m.group(1).lower()]
+        return "year"
+
+    def _detect_duration(self, text: str, keyword_regex: str) -> Optional[Tuple[float, str]]:
+        num = r"(\d+(?:\.\d+)?)"
+        m = re.search(keyword_regex + r"[^\d]{0,40}" + num + r"\s*(day|days|week|weeks|month|months|year|years)\b", text, re.I)
+        if m:
+            return float(m.group(1)), self._PERIOD_WORDS[m.group(2).lower()]
+        return None
+
+    def normalize_time_units(self, question: str, model: str, inputs: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+        """Convert every rate to one consistent time basis before any tool is called.
+
+        EOQ / Quantity Discount: demand is converted to the holding-cost period (annual by default).
+        Safety Stock / Fixed-Period Review: lead time, its std dev and the review period are converted
+        into the demand period (demand std dev is already per demand period).
+        Values that were already converted (e.g. by Gemini) are left unchanged, so nothing is converted twice.
+        """
+        inputs = dict(inputs)
+        notes: List[str] = []
+        demand = self._detect_demand_period(question)
+
+        if model in (self.MODEL_EOQ, self.MODEL_QUANTITY_DISCOUNT):
+            if demand is None:
+                return inputs, notes
+            raw, d_per = demand
+            h_per = self._detect_holding_period(question)
+            if d_per == h_per:
+                return inputs, notes
+            factor = self._PERIODS_PER_YEAR[d_per] / self._PERIODS_PER_YEAR[h_per]
+            converted = raw * factor
+            for key in ("demand", "annual_demand"):
+                v = inputs.get(key)
+                if v is None:
+                    continue
+                if math.isclose(float(v), raw, rel_tol=1e-9):
+                    inputs[key] = converted
+                elif math.isclose(float(v), converted, rel_tol=1e-6):
+                    pass  # already converted upstream
+            if any(k in inputs for k in ("demand", "annual_demand")):
+                notes.append(
+                    f"Demand stated per {d_per} ({raw:,.4g}) but holding cost is per {h_per}: "
+                    f"D = {raw:,.4g} x {factor:g} = {converted:,.4f} units per {h_per}."
+                )
+            return inputs, notes
+
+        if model in (self.MODEL_SAFETY_STOCK_ROP, self.MODEL_FIXED_PERIOD_REVIEW):
+            if demand is None:
+                return inputs, notes
+            _, d_per = demand
+            checks = [
+                ("lead_time", r"lead[\s-]*time"),
+                ("review_period", r"(?:review\s+period|review\s+interval|reviews?\s+every|reviewed\s+every|every)"),
+            ]
+            lt = self._detect_duration(question, r"lead[\s-]*time")
+            for key, kw in checks:
+                found = self._detect_duration(question, kw)
+                if not found or key not in inputs or inputs[key] is None:
+                    continue
+                val, unit = found
+                if unit == d_per or not math.isclose(float(inputs[key]), val, rel_tol=1e-9):
+                    continue
+                f = self._DAYS_PER_PERIOD[unit] / self._DAYS_PER_PERIOD[d_per]
+                inputs[key] = val * f
+                notes.append(f"{key} stated as {val:g} {unit}(s); demand is per {d_per}: {val:g} x {f:.6g} = {val * f:.4f} {d_per}s.")
+                if key == "lead_time" and inputs.get("std_lead_time"):
+                    s = float(inputs["std_lead_time"])
+                    inputs["std_lead_time"] = s * f
+                    notes.append(f"std_lead_time {s:g} {unit}(s) -> {s * f:.4f} {d_per}s (same unit as lead time).")
+            return inputs, notes
+
+        return inputs, notes
+
     def _extract_discount_schedule(self, text: str) -> Optional[List[Dict[str, Any]]]:
         """Attempt to extract structured discount schedule tiers from text."""
         raw_tiers: List[Tuple[float, Optional[float], float]] = []
@@ -1080,6 +1198,8 @@ Rules:
         out: List[str] = ["---", "## 📘 Verifiable Worksheet (all numbers produced by the Python tool)"]
 
         out.append("\n### 1. Inputs Extracted")
+        for note in results.get("unit_conversions", []):
+            out.append(f"- **Unit conversion:** {note}")
         for k, v in results.get("inputs_extracted", {}).items():
             if isinstance(v, list):
                 out.append(f"- `{k}`:")
@@ -1267,6 +1387,16 @@ Rules:
                     extraction_method=extraction_method,
                 )
 
+        # Step 2b: Normalize time units (deterministic Python, applies to Gemini and regex paths)
+        extracted_inputs, unit_notes = self.normalize_time_units(question, model, extracted_inputs)
+        if unit_notes:
+            trace.append(AgentStep(
+                step_name="Normalize Time Units",
+                status="SUCCESS",
+                details={"conversions": unit_notes, "normalized_inputs": extracted_inputs},
+                description="Converted rates to a consistent time basis: " + " ".join(unit_notes),
+            ))
+
         # Step 3: Select Python Tool
         try:
             tool_name = self.select_tool(model)
@@ -1334,6 +1464,8 @@ Rules:
         # Step 4: Calculate (Strict Deterministic Python Engine)
         try:
             calc_results = self.calculate(tool_name, extracted_inputs)
+            if unit_notes:
+                calc_results["unit_conversions"] = unit_notes
             trace.append(AgentStep(
                 step_name="Calculate",
                 status="SUCCESS",
