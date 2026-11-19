@@ -1216,3 +1216,153 @@ def calculate_newsvendor(
         ] + _dsub,
         checks=_checks,
     )
+
+
+# ============================================================================
+# 6. MULTICRITERIA INVENTORY CLASSIFICATION (SALES x HITS, A/B/C/D)
+# ============================================================================
+
+CLASSIFICATION_PARAMETERS: Dict[str, Any] = {
+    "sales_weight": 0.65,
+    "hits_weight": 0.35,
+    "pareto_cutoffs": {"A": (0, 60), "B": (61, 80), "C": (81, 90), "D": (91, 100)},
+    "class_scores": {"A": 4, "B": 3, "C": 2, "D": 1},
+    "final_cutoffs": {"A": "score >= 3.25", "B": "2.50 - 3.24", "C": "1.75 - 2.49", "D": "score < 1.75"},
+}
+
+CLASSIFICATION_REQUIRED_COLUMNS = ["Item Number", "Item Name", "UoM", "Sales ($)", "Hits"]
+_CLASS_SCORE = CLASSIFICATION_PARAMETERS["class_scores"]
+
+
+def _pareto_class_from_pct(pct: int) -> str:
+    if pct <= 60:
+        return "A"
+    if pct <= 80:
+        return "B"
+    if pct <= 90:
+        return "C"
+    return "D"
+
+
+def _final_class_from_score(score: float) -> str:
+    if score >= 3.25:
+        return "A"
+    if score >= 2.50:
+        return "B"
+    if score >= 1.75:
+        return "C"
+    return "D"
+
+
+def _pareto_classify(df, value_col: str, id_col: str, prefix: str):
+    """Independent Pareto analysis of one criterion; returns Series indexed like df."""
+    import numpy as np
+
+    order = df.sort_values([value_col, "_ItemKey"], ascending=[False, True], kind="mergesort").index
+    values = df.loc[order, value_col].astype(float)
+    total = float(values.sum())
+    if total <= 0:
+        raise ValueError(f"Total of '{value_col}' must be positive to compute cumulative percentages.")
+    cum_pct = values.cumsum() / total * 100.0
+    # Round half up to a whole percent (1e-9 guards against float noise such as 59.4999999)
+    cum_int = np.floor(cum_pct + 0.5 + 1e-9).astype(int)
+    classes = cum_int.map(_pareto_class_from_pct)
+    return cum_int.reindex(df.index), classes.reindex(df.index)
+
+
+def classify_inventory_abcd(df):
+    """Multicriteria A/B/C/D inventory classification using Sales ($) and Hits.
+
+    Step 1: Two independent Pareto analyses (Sales, Hits). Cumulative % (including the
+            item itself) is rounded to a whole percent; A: 0-60, B: 61-80, C: 81-90,
+            D: 91-100. Ties are broken by Item Number ascending. Classes score A=4..D=1.
+    Step 2: Weighted Score = 0.65 x Sales Score + 0.35 x Hits Score (2 decimals).
+    Step 3: Final Class: A >= 3.25, B 2.50-3.24, C 1.75-2.49, D < 1.75.
+
+    Each Item Number is a separate item (never grouped by Item Name). The input
+    dataframe is not modified. Returns a new dataframe sorted by Weighted Score
+    descending, then Sales descending (then Item Number ascending).
+    """
+    import pandas as pd
+
+    missing = [c for c in CLASSIFICATION_REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError("Missing required column(s): " + ", ".join(missing))
+    if df.empty:
+        raise ValueError("The dataframe contains no data rows.")
+
+    work = df[CLASSIFICATION_REQUIRED_COLUMNS].copy().reset_index(drop=True)
+    work["Item Name"] = work["Item Name"].astype(str).str.strip()
+    work["UoM"] = work["UoM"].astype(str).str.strip()
+    work["Item Number"] = work["Item Number"].astype(str).str.strip()
+    # Tie-break key: numeric ordering when all Item Numbers are numeric, else text ordering
+    _num = pd.to_numeric(work["Item Number"], errors="coerce")
+    work["_ItemKey"] = _num if _num.notna().all() else work["Item Number"]
+
+    for col in ("Sales ($)", "Hits"):
+        if work[col].dtype == object:
+            work[col] = work[col].astype(str).str.replace(r"[\$,\s]", "", regex=True)
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+        bad = work[work[col].isna()]
+        if not bad.empty:
+            raise ValueError(
+                f"{len(bad)} row(s) have non-numeric or missing '{col}' "
+                f"(data row numbers: {', '.join(str(i + 2) for i in bad.index[:10])})."
+            )
+        if (work[col] < 0).any():
+            raise ValueError(f"'{col}' contains negative values.")
+    if work["Item Number"].duplicated().any():
+        dups = work.loc[work["Item Number"].duplicated(), "Item Number"].unique()[:10]
+        raise ValueError("Duplicate Item Number(s) found: " + ", ".join(map(str, dups)))
+
+    work["Sales Cum %"], work["Sales Class"] = _pareto_classify(work, "Sales ($)", "Item Number", "Sales")
+    work["Hits Cum %"], work["Hits Class"] = _pareto_classify(work, "Hits", "Item Number", "Hits")
+    work["Sales Score"] = work["Sales Class"].map(_CLASS_SCORE)
+    work["Hits Score"] = work["Hits Class"].map(_CLASS_SCORE)
+
+    w_s = CLASSIFICATION_PARAMETERS["sales_weight"]
+    w_h = CLASSIFICATION_PARAMETERS["hits_weight"]
+    work["Weighted Score"] = (w_s * work["Sales Score"] + w_h * work["Hits Score"]).round(2)
+    work["Final Class"] = work["Weighted Score"].map(_final_class_from_score)
+
+    cols = [
+        "Item Number", "Item Name", "UoM", "Sales ($)", "Sales Cum %", "Sales Class", "Sales Score",
+        "Hits", "Hits Cum %", "Hits Class", "Hits Score", "Weighted Score", "Final Class",
+    ]
+    ordered = work.sort_values(
+        ["Weighted Score", "Sales ($)", "_ItemKey"], ascending=[False, False, True], kind="mergesort"
+    )
+    return ordered[cols].reset_index(drop=True)
+
+
+def summarize_classification(classified):
+    """Summary by Final Class (items, total sales, % items, % sales) with a Total row."""
+    import pandas as pd
+
+    n = len(classified)
+    total_sales = float(classified["Sales ($)"].sum())
+    rows = []
+    for cls in ["A", "B", "C", "D"]:
+        sub = classified[classified["Final Class"] == cls]
+        sales = float(sub["Sales ($)"].sum())
+        rows.append({
+            "Final Class": cls,
+            "Items": int(len(sub)),
+            "Total Sales ($)": sales,
+            "% of Items": len(sub) / n * 100.0 if n else 0.0,
+            "% of Total Sales": sales / total_sales * 100.0 if total_sales else 0.0,
+        })
+    rows.append({
+        "Final Class": "Total",
+        "Items": n,
+        "Total Sales ($)": total_sales,
+        "% of Items": 100.0 if n else 0.0,
+        "% of Total Sales": 100.0 if total_sales else 0.0,
+    })
+    return pd.DataFrame(rows)
+
+
+def class_counts(classified, column: str):
+    """Count of items in each class (A-D, zero-filled) for 'Sales Class' or 'Hits Class'."""
+    counts = classified[column].value_counts().reindex(["A", "B", "C", "D"], fill_value=0)
+    return counts.rename_axis(column).rename("Items").reset_index()

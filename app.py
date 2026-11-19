@@ -100,6 +100,76 @@ def analyze_inventory_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 # ============================================================================
+# MULTICRITERIA INVENTORY CLASSIFICATION (Streamlit rendering)
+# ============================================================================
+
+def render_classification_section(st, df_upload: pd.DataFrame) -> None:
+    """Classify the already-uploaded dataframe (Sales x Hits) and display results."""
+    st.subheader("🏷️ Multicriteria Inventory Classification (A/B/C/D)")
+    try:
+        classified = inventory_tools.classify_inventory_abcd(df_upload)
+    except ValueError as e:
+        st.error(f"Classification could not be performed: {e}")
+        return
+
+    params = inventory_tools.CLASSIFICATION_PARAMETERS
+    with st.expander("Parameters used (fixed)", expanded=True):
+        st.markdown(
+            f"""
+- **Weights:** Sales {params['sales_weight']:.2f}, Hits {params['hits_weight']:.2f}
+- **Pareto cumulative % classes (Sales and Hits, analyzed independently):** A: 0-60, B: 61-80, C: 81-90, D: 91-100 (cumulative % includes the item itself, rounded to a whole percent; ties broken by Item Number ascending)
+- **Class scores:** A=4, B=3, C=2, D=1
+- **Weighted Score:** 0.65 × Sales Score + 0.35 × Hits Score (2 decimals)
+- **Final Class:** A if score ≥ 3.25; B if 2.50-3.24; C if 1.75-2.49; D if below 1.75
+"""
+        )
+
+    st.markdown("**Summary by Final Class**")
+    summary = inventory_tools.summarize_classification(classified)
+    st.dataframe(
+        summary,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Total Sales ($)": st.column_config.NumberColumn("Total Sales ($)", format="$%.2f"),
+            "% of Items": st.column_config.NumberColumn("% of Items", format="%.2f%%"),
+            "% of Total Sales": st.column_config.NumberColumn("% of Total Sales", format="%.2f%%"),
+        },
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Items in each Sales Class**")
+        st.dataframe(inventory_tools.class_counts(classified, "Sales Class"), hide_index=True, use_container_width=True)
+    with c2:
+        st.markdown("**Items in each Hits Class**")
+        st.dataframe(inventory_tools.class_counts(classified, "Hits Class"), hide_index=True, use_container_width=True)
+
+    st.markdown("**Classification Results** (sorted by Weighted Score, then Sales)")
+    display_cols = [
+        "Item Number", "Item Name", "Sales ($)", "Sales Cum %", "Sales Class", "Sales Score",
+        "Hits", "Hits Cum %", "Hits Class", "Hits Score", "Weighted Score", "Final Class",
+    ]
+    st.dataframe(
+        classified[display_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Sales ($)": st.column_config.NumberColumn("Sales ($)", format="$%.2f"),
+            "Sales Cum %": st.column_config.NumberColumn("Sales Cum %", format="%d%%"),
+            "Hits Cum %": st.column_config.NumberColumn("Hits Cum %", format="%d%%"),
+            "Weighted Score": st.column_config.NumberColumn("Weighted Score", format="%.2f"),
+        },
+    )
+    st.download_button(
+        "Download classification results (CSV)",
+        classified[display_cols].to_csv(index=False).encode("utf-8"),
+        file_name="inventory_classification.csv",
+        mime="text/csv",
+    )
+
+
+# ============================================================================
 # STREAMLIT WEB APPLICATION
 # ============================================================================
 
@@ -509,12 +579,22 @@ def run_streamlit_app():
             df_upload = None
 
         if df_upload is not None:
+            df_upload.columns = [str(c).strip() for c in df_upload.columns]
             missing_cols = [c for c in REQUIRED_UPLOAD_COLUMNS if c not in df_upload.columns]
-            if missing_cols:
+            has_class_cols = all(c in df_upload.columns for c in inventory_tools.CLASSIFICATION_REQUIRED_COLUMNS)
+
+            if has_class_cols:
+                render_classification_section(st, df_upload)
+
+            if missing_cols and has_class_cols:
+                pass  # Classification-style file: the legacy Units/Unit Cost analysis does not apply.
+            elif missing_cols:
                 st.error(
-                    "The uploaded file is missing required column(s): "
-                    + ", ".join(f"**{c}**" for c in missing_cols)
-                    + ". Required columns: " + ", ".join(REQUIRED_UPLOAD_COLUMNS) + "."
+                    "The uploaded file does not match a supported layout. Either include the "
+                    "inventory-analysis columns: " + ", ".join(f"**{c}**" for c in REQUIRED_UPLOAD_COLUMNS)
+                    + "; or the classification columns: "
+                    + ", ".join(f"**{c}**" for c in inventory_tools.CLASSIFICATION_REQUIRED_COLUMNS)
+                    + ". Missing for inventory analysis: " + ", ".join(missing_cols) + "."
                 )
                 st.subheader("Uploaded Data")
                 st.dataframe(df_upload, use_container_width=True)

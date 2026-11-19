@@ -89,3 +89,7 @@ streamlit run app.py
 pytest -v
 ```
 All 19 unit tests, edge-case tests, and end-to-end agent pipeline queries will execute and verify mathematical accuracy.
+
+## Multicriteria Inventory Classification (A/B/C/D)
+
+Upload a CSV with `Item Number, Item Name, UoM, Sales ($), Hits` in the sidebar uploader. The app runs two independent Pareto analyses (Sales and Hits; cumulative % rounded to a whole percent; A 0-60, B 61-80, C 81-90, D 91-100; A=4..D=1), computes Weighted Score = 0.65 x Sales Score + 0.35 x Hits Score, and assigns the Final Class (A >= 3.25, B 2.50-3.24, C 1.75-2.49, D < 1.75). Parameters are fixed. Implemented in `inventory_tools.classify_inventory_abcd`.
