@@ -235,6 +235,10 @@ Rules:
         if re.search(r"\d+\s*-\s*\d+\s*:", q) or re.search(r"\d+\s*\+\s*:", q):
             scores[self.MODEL_QUANTITY_DISCOUNT] += 4.5
 
+        sched = self._extract_discount_schedule(question)
+        if sched and len(sched) >= 2 and len({s["price"] for s in sched}) >= 2:
+            scores[self.MODEL_QUANTITY_DISCOUNT] += 8.0
+
         # Fixed Period Review cues
         if any(w in q for w in ["fixed period", "fixed-period", "periodic review", "order-up-to", "order up to", "target level", "review period", "base stock", "p-system", "periodic system"]):
             scores[self.MODEL_FIXED_PERIOD_REVIEW] += 7.0
@@ -413,6 +417,10 @@ Rules:
         std_lead_time = extract_first([
             r"(?:lead[-_\s]*time\s+standard\s+deviation|standard\s+deviation\s+of\s+lead\s+time|lead[-_\s]*time\s+std\s+dev|sigma_l)[^\d]*(" + num_pat + ")",
             r"(?:variability\s+in\s+lead\s+time)[^\d]*(" + num_pat + ")",
+            # "lead time is 3 weeks with a standard deviation of 0.5 weeks"
+            r"lead[-_\s]*time[^.;]*?(?:standard\s+deviation|std\s+dev)\s*(?:of|is|equals)?\s*(" + num_pat + ")",
+            # any standard deviation expressed in a time unit is a lead-time deviation
+            r"(?:standard\s+deviation|std\s+dev)\s*(?:of|is|equals)?\s*(" + num_pat + r")\s*(?:days?|weeks?|months?)\b",
         ])
 
         # --------------------------------------------------------------------
@@ -420,8 +428,8 @@ Rules:
         # --------------------------------------------------------------------
         std_demand = extract_first([
             r"(?:demand\s+standard\s+deviation|standard\s+deviation\s+of\s+demand|demand\s+std\s+dev|std\s+dev\s+of\s+demand|sigma_d)[^\d]*(" + num_pat + ")",
-            r"(?:with\s+a\s+standard\s+deviation\s+of|standard\s+deviation\s+of|standard\s+deviation\s+is)\s*(" + num_pat + ")",
-            r"(?:standard\s+deviation|std\s+dev)[^\d]*(" + num_pat + ")",
+            r"(?:with\s+a\s+standard\s+deviation\s+of|standard\s+deviation\s+of|standard\s+deviation\s+is)\s*(" + num_pat + r")(?!\d|\s*(?:days?|weeks?|months?)\b)",
+            r"(?:standard\s+deviation|std\s+dev)[^\d]*(" + num_pat + r")(?!\d|\s*(?:days?|weeks?|months?)\b)",
         ])
 
         # --------------------------------------------------------------------
@@ -824,9 +832,33 @@ Rules:
         """Attempt to extract structured discount schedule tiers from text."""
         raw_tiers: List[Tuple[float, Optional[float], float]] = []
 
+        # Pattern 0 (price first): "$12 per unit for orders below 500 units",
+        # "$11.50 for 500-999 units", "$11 for orders of 1,000 units or more"
+        n = r"(\d{1,3}(?:,\d{3})+|\d+)"
+        price_first: List[Tuple[float, Optional[float], float]] = []
+        for m in re.finditer(r"\$\s*(\d+(?:\.\d+)?)\s*(?:per\s+unit|each|/unit)?\s*(?:for|on|when)\s+(?:orders?\s+|quantities\s+|purchases\s+)?(?:of\s+)?([^.;$]*?)(?=,(?!\d)|\.\s|\.$|;|\$|\band\b\s*\$|$)", text, re.I):
+            price = float(m.group(1))
+            clause = m.group(2)
+            mm = re.search(r"(?:below|under|less\s+than|fewer\s+than|up\s+to)\s+" + n, clause, re.I)
+            if mm:
+                upper = float(mm.group(1).replace(",", ""))
+                if re.search(r"up\s+to", clause, re.I) is None:
+                    upper -= 1
+                price_first.append((0.0, upper, price))
+                continue
+            mm = re.search(n + r"\s*(?:-|to|through)\s*" + n, clause, re.I)
+            if mm:
+                price_first.append((float(mm.group(1).replace(",", "")), float(mm.group(2).replace(",", "")), price))
+                continue
+            mm = re.search(n + r"\s*(?:units?\s*)?(?:\+|or\s+more|or\s+above|and\s+above|and\s+up|or\s+greater)", clause, re.I)
+            if mm:
+                price_first.append((float(mm.group(1).replace(",", "")), None, price))
+        if len(price_first) >= 2:
+            raw_tiers = price_first
+
         # Pattern 1: Bounded ranges, e.g.:
         # "0-499: $30", "1 to 499 units at $50", "Tier 1: 0 - 499 for $20"
-        range_matches = re.findall(
+        range_matches = [] if raw_tiers else re.findall(
             r"(?:tier\s*\d+[:\s]*)?([\d,]+)\s*(?:-|to)\s*([\d,]+)\s*(?:units)?\s*[:@=]?\s*(?:at|for)?\s*\$?\s*([\d\.]+)",
             text,
             re.IGNORECASE,
@@ -839,7 +871,7 @@ Rules:
 
         # Pattern 2: Open-ended upper tiers, e.g.:
         # "1000+: $25", "1000 or more: $25", "1000 and above at $20", "1000+ units @ $40"
-        plus_matches = re.findall(
+        plus_matches = [] if len(raw_tiers) >= 2 and raw_tiers is price_first else re.findall(
             r"(?:tier\s*\d+[:\s]*)?([\d,]+)\s*(?:\+|or\s+more|and\s+above)\s*(?:units)?\s*[:@=]?\s*(?:at|for)?\s*\$?\s*([\d\.]+)",
             text,
             re.IGNORECASE,
@@ -1386,6 +1418,42 @@ Rules:
                     error_message=str(e),
                     extraction_method=extraction_method,
                 )
+
+        # Step 2-cross-check: when Gemini extracted the inputs, fill any value it left out (or set to 0)
+        # from the deterministic extractor, so a missed parameter is never silently treated as zero.
+        if gemini_success:
+            try:
+                regex_inputs, _ = self.extract_inputs(question, model)
+                filled = {}
+                for k, v in regex_inputs.items():
+                    gv = extracted_inputs.get(k)
+                    if (gv is None or (isinstance(gv, (int, float)) and gv == 0)) and v not in (None, 0, 0.0):
+                        extracted_inputs[k] = v
+                        filled[k] = v
+                if filled:
+                    missing_inputs = [m for m in missing_inputs if not any(m.startswith(k) for k in filled)]
+                    trace.append(AgentStep(
+                        step_name="Cross-Check Gemini Extraction",
+                        status="SUCCESS",
+                        details={"filled_from_deterministic_extractor": filled},
+                        description=f"Filled {len(filled)} parameter(s) Gemini omitted: {', '.join(filled)}.",
+                    ))
+            except Exception:
+                pass
+
+        # Step 2a: Deterministic model guard. A stated price schedule with different unit prices
+        # for different order quantities is a quantity-discount problem, whatever the extractor said.
+        sched = self._extract_discount_schedule(question)
+        if sched and len(sched) >= 2 and len({s["price"] for s in sched}) >= 2 and model != self.MODEL_QUANTITY_DISCOUNT:
+            previous = model
+            model = self.MODEL_QUANTITY_DISCOUNT
+            extracted_inputs, missing_inputs = self.extract_inputs(question, model)
+            trace.append(AgentStep(
+                step_name="Model Guard: Quantity Discount Detected",
+                status="SUCCESS",
+                details={"previous_model": previous, "price_schedule": sched, "inputs": extracted_inputs},
+                description=f"Detected {len(sched)} price tiers in the question; switched model from {previous} to QUANTITY_DISCOUNT and re-extracted inputs.",
+            ))
 
         # Step 2b: Normalize time units (deterministic Python, applies to Gemini and regex paths)
         extracted_inputs, unit_notes = self.normalize_time_units(question, model, extracted_inputs)
