@@ -742,3 +742,89 @@ class TestUploadedCsvAnalysis:
         df.loc[0, "Units"] = "abc"
         with pytest.raises(ValueError, match="non-numeric"):
             analyze_inventory_dataframe(df)
+
+
+# ============================================================================
+# MULTICRITERIA INVENTORY CLASSIFICATION (Sales x Hits)
+# ============================================================================
+
+import pandas as pd
+import inventory_tools as _it
+
+
+def _frame(rows):
+    return pd.DataFrame(rows, columns=["Item Number", "Item Name", "UoM", "Sales ($)", "Hits"])
+
+
+def test_classification_hand_checked_example():
+    df = _frame([
+        ["I1", " Widget ", " EA ", 50, 5],
+        ["I2", "Widget", "EA", 30, 15],
+        ["I3", "Gadget", "EA", 15, 30],
+        ["I4", "Gizmo", "EA", 5, 50],
+    ])
+    out = _it.classify_inventory_abcd(df).set_index("Item Number")
+    assert out["Sales Cum %"].to_dict() == {"I1": 50, "I2": 80, "I3": 95, "I4": 100}
+    assert out["Sales Class"].to_dict() == {"I1": "A", "I2": "B", "I3": "D", "I4": "D"}
+    assert out["Hits Cum %"].to_dict() == {"I4": 50, "I3": 80, "I2": 95, "I1": 100}
+    assert out["Hits Class"].to_dict() == {"I4": "A", "I3": "B", "I2": "D", "I1": "D"}
+    assert out["Weighted Score"].to_dict() == {"I1": 2.95, "I2": 2.30, "I3": 1.70, "I4": 2.05}
+    assert out["Final Class"].to_dict() == {"I1": "B", "I2": "C", "I3": "D", "I4": "C"}
+    # Same Item Name stays as two separate items
+    assert len(out) == 4
+    # Sorted by weighted score descending
+    assert list(_it.classify_inventory_abcd(df)["Item Number"]) == ["I1", "I2", "I4", "I3"]
+
+
+def test_classification_pareto_boundaries():
+    # Cumulative exactly 60 -> A, 80 -> B, 90 -> C, 100 -> D
+    df = _frame([["A1", "a", "EA", 60, 1], ["A2", "b", "EA", 20, 1], ["A3", "c", "EA", 10, 1], ["A4", "d", "EA", 10, 1]])
+    out = _it.classify_inventory_abcd(df).set_index("Item Number")
+    assert out["Sales Cum %"].to_dict() == {"A1": 60, "A2": 80, "A3": 90, "A4": 100}
+    assert out["Sales Class"].to_dict() == {"A1": "A", "A2": "B", "A3": "C", "A4": "D"}
+    # 60.5% rounds to 61 -> B ; 60.4% rounds to 60 -> A
+    out = _it.classify_inventory_abcd(_frame([["X", "x", "EA", 605, 1], ["Y", "y", "EA", 395, 1]])).set_index("Item Number")
+    assert out.loc["X", "Sales Cum %"] == 61 and out.loc["X", "Sales Class"] == "B"
+    out = _it.classify_inventory_abcd(_frame([["X", "x", "EA", 604, 1], ["Y", "y", "EA", 396, 1]])).set_index("Item Number")
+    assert out.loc["X", "Sales Cum %"] == 60 and out.loc["X", "Sales Class"] == "A"
+
+
+def test_final_class_score_boundaries():
+    f = _it._final_class_from_score
+    assert [f(s) for s in (3.25, 3.24, 2.50, 2.49, 1.75, 1.74)] == ["A", "B", "B", "C", "C", "D"]
+
+
+def test_classification_tie_break_by_item_number():
+    # Equal sales: lower Item Number is ranked first and absorbs the cumulative % first
+    df = _frame([["B2", "n", "EA", 50, 1], ["A1", "n", "EA", 50, 1]])
+    out = _it.classify_inventory_abcd(df).set_index("Item Number")
+    assert out.loc["A1", "Sales Cum %"] == 50 and out.loc["B2", "Sales Cum %"] == 100
+
+
+def test_classification_does_not_modify_input_and_validates():
+    df = _frame([["I1", " n ", " EA ", 10, 1], ["I2", "m", "EA", 5, 2]])
+    before = df.copy(deep=True)
+    _it.classify_inventory_abcd(df)
+    pd.testing.assert_frame_equal(df, before)
+    with pytest.raises(ValueError):
+        _it.classify_inventory_abcd(df.drop(columns=["Hits"]))
+    with pytest.raises(ValueError):
+        _it.classify_inventory_abcd(_frame([["I1", "n", "EA", "abc", 1]]))
+    with pytest.raises(ValueError):
+        _it.classify_inventory_abcd(_frame([["I1", "n", "EA", 0, 1]]))
+
+
+def test_classification_summary_and_counts():
+    df = _frame([["I1", "a", "EA", 50, 5], ["I2", "b", "EA", 30, 15], ["I3", "c", "EA", 15, 30], ["I4", "d", "EA", 5, 50]])
+    c = _it.classify_inventory_abcd(df)
+    s = _it.summarize_classification(c).set_index("Final Class")
+    assert s.loc["B", "Items"] == 1 and s.loc["C", "Items"] == 2 and s.loc["A", "Items"] == 0
+    assert s.loc["C", "Total Sales ($)"] == 35 and s.loc["Total", "Total Sales ($)"] == 100
+    assert s.loc["C", "% of Items"] == 50 and s.loc["Total", "% of Total Sales"] == 100
+    assert _it.class_counts(c, "Sales Class")["Items"].tolist() == [1, 1, 0, 2]
+
+
+def test_classification_tie_break_is_numeric_for_numeric_ids():
+    df = _frame([[100, "n", "EA", 50, 1], [98, "n", "EA", 50, 1]])
+    out = _it.classify_inventory_abcd(df).set_index("Item Number")
+    assert out.loc["98", "Sales Cum %"] == 50 and out.loc["100", "Sales Cum %"] == 100
